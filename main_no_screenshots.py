@@ -17,18 +17,18 @@ import sys
 import os
 import requests
 import json
+import math
 import mysql.connector
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Import generators
+# Import generators (none of these use Playwright)
 from chargeback_generator_fraud import generate_pdf as generate_fraud_pdf
 from chargeback_generator_pnr import generate_pdf as generate_pnr_pdf
 from chargeback_generator_pna import generate_pdf as generate_pna_pdf
 from session_evidence_extractor import SessionEvidenceExtractor
 from public_records import get_public_records, format_public_records_for_pdf
-from map_generator import get_location_data, analyze_locations
 
 # Configuration
 N8N_WEBHOOK = "https://dan-fugu.app.n8n.cloud/webhook/55614aa6-0d64-4390-ab2c-d595b6e0fda4"
@@ -42,6 +42,132 @@ DB_CONFIG = {
     'password': 'UrxP3FmJ+z1bF1Xjs<*%'
 }
 
+
+# ============================================================================
+# LOCATION ANALYSIS (inlined from map_generator.py to avoid Playwright import)
+# ============================================================================
+
+def get_location_data(paymentid):
+    """Get IP, billing, and shipping location coordinates from database."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        query = """
+            SELECT ipcache.data, p.billing_address, pb.address
+            FROM payments p
+            JOIN ipcache ON ipcache.ip = p.ip
+            LEFT JOIN paymentbeneficiaries pb ON p.paymentid = pb.payments_paymentid
+            WHERE paymentid = %s
+        """
+        cursor.execute(query, (paymentid,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if not result:
+            return None
+
+        ip_data_raw, billing_data_raw, shipping_data_raw = result
+        ip_data = json.loads(ip_data_raw) if isinstance(ip_data_raw, str) else ip_data_raw
+        billing_data = json.loads(billing_data_raw) if isinstance(billing_data_raw, str) else billing_data_raw
+        shipping_data = json.loads(shipping_data_raw) if isinstance(shipping_data_raw, str) else shipping_data_raw if shipping_data_raw else None
+
+        locations = {}
+
+        if ip_data and ip_data.get('latitude') and ip_data.get('longitude'):
+            locations['ip'] = {
+                'lat': ip_data['latitude'], 'lng': ip_data['longitude'],
+                'label': 'IP Location', 'city': ip_data.get('city', ''),
+                'region': ip_data.get('region', ''), 'country': ip_data.get('country_name', ''),
+                'color': '#e53e3e'
+            }
+        if billing_data and billing_data.get('latitude') and billing_data.get('longitude'):
+            locations['billing'] = {
+                'lat': billing_data['latitude'], 'lng': billing_data['longitude'],
+                'label': 'Billing Address', 'address': billing_data.get('address1', ''),
+                'city': billing_data.get('city', ''), 'region': billing_data.get('province', ''),
+                'country': billing_data.get('country', ''), 'color': '#3182ce'
+            }
+        if shipping_data and shipping_data.get('latitude') and shipping_data.get('longitude'):
+            locations['shipping'] = {
+                'lat': shipping_data['latitude'], 'lng': shipping_data['longitude'],
+                'label': 'Shipping Address', 'address': shipping_data.get('address1', ''),
+                'city': shipping_data.get('city', ''), 'region': shipping_data.get('province', ''),
+                'country': shipping_data.get('country', ''), 'color': '#38a169'
+            }
+
+        return locations
+    except Exception as e:
+        print(f"Error getting location data: {e}")
+        return None
+
+
+def _calculate_distance(lat1, lng1, lat2, lng2):
+    """Calculate distance between two points in miles using Haversine formula."""
+    R = 3959
+    lat1_rad, lat2_rad = math.radians(lat1), math.radians(lat2)
+    delta_lat, delta_lng = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
+    a = math.sin(delta_lat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lng / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def analyze_locations(locations, max_relevant_distance=100):
+    """Analyze locations and determine which are relevant (close to each other)."""
+    analysis = {
+        'distances': {}, 'relevant_locations': [], 'all_close': False,
+        'summary': '', 'summary_text': ''
+    }
+    if not locations:
+        return analysis
+
+    location_keys = list(locations.keys())
+    for i, key1 in enumerate(location_keys):
+        for key2 in location_keys[i + 1:]:
+            loc1, loc2 = locations[key1], locations[key2]
+            dist = _calculate_distance(loc1['lat'], loc1['lng'], loc2['lat'], loc2['lng'])
+            analysis['distances'][f"{key1}_to_{key2}"] = round(dist, 2)
+
+    if 'ip' in locations:
+        analysis['relevant_locations'].append('ip')
+    if 'ip' in locations and 'billing' in locations:
+        if analysis['distances'].get('ip_to_billing', float('inf')) <= max_relevant_distance:
+            analysis['relevant_locations'].append('billing')
+    if 'shipping' in locations:
+        close_to_ip = 'ip' in locations and analysis['distances'].get('ip_to_shipping', float('inf')) <= max_relevant_distance
+        close_to_billing = 'billing' in locations and analysis['distances'].get('billing_to_shipping', float('inf')) <= max_relevant_distance
+        if close_to_ip or close_to_billing:
+            analysis['relevant_locations'].append('shipping')
+
+    all_distances = list(analysis['distances'].values())
+    if all_distances and max(all_distances) <= max_relevant_distance:
+        analysis['all_close'] = True
+
+    summaries = []
+    if 'ip_to_billing' in analysis['distances']:
+        summaries.append(f"IP to Billing: {analysis['distances']['ip_to_billing']:.1f} miles")
+    if 'ip_to_shipping' in analysis['distances']:
+        summaries.append(f"IP to Shipping: {analysis['distances']['ip_to_shipping']:.1f} miles")
+    if 'billing_to_shipping' in analysis['distances']:
+        summaries.append(f"Billing to Shipping: {analysis['distances']['billing_to_shipping']:.1f} miles")
+    analysis['summary'] = " | ".join(summaries)
+
+    text_parts = []
+    if 'ip_to_billing' in analysis['distances']:
+        text_parts.append(f"The transaction IP address is located approximately {analysis['distances']['ip_to_billing']:.1f} miles from the billing address")
+    if 'ip_to_shipping' in analysis['distances']:
+        text_parts.append(f"{analysis['distances']['ip_to_shipping']:.1f} miles from the shipping address")
+    if 'billing_to_shipping' in analysis['distances']:
+        d = analysis['distances']['billing_to_shipping']
+        text_parts.append("Billing and shipping addresses are at the same location" if d < 1 else f"Billing and shipping addresses are {d:.1f} miles apart")
+    analysis['summary_text'] = ". ".join(text_parts) + "." if text_parts else ""
+
+    return analysis
+
+
+# ============================================================================
+# DATABASE & PARSING
+# ============================================================================
 
 def get_payment_info(paymentid):
     """Get tenant_id, externalreference, shopname, and payer_mobile from database"""
