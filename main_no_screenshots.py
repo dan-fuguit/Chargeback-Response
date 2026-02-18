@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chargeback_generator_fraud import generate_pdf as generate_fraud_pdf
 from chargeback_generator_pnr import generate_pdf as generate_pnr_pdf
 from chargeback_generator_pna import generate_pdf as generate_pna_pdf
+from chargeback_generator_cnp import generate_pdf as generate_cnp_pdf
 from session_evidence_extractor import SessionEvidenceExtractor
 from public_records import get_public_records, format_public_records_for_pdf
 from map_generator import get_location_data, analyze_locations
@@ -106,6 +107,13 @@ PNA_REASONS = [
     "quality_issue",
 ]
 
+# Credit Not Processed - same layout as PNA + payment verification image before shipping
+CNP_REASONS = [
+    "credit_not_processed",
+    "credit_not_issued",
+    "refund_not_processed",
+]
+
 
 def get_reason_type(reason):
     """Determine which generator to use based on reason code"""
@@ -120,6 +128,8 @@ def get_reason_type(reason):
         return "pnr"
     elif reason_lower in PNA_REASONS:
         return "pna"
+    elif reason_lower in CNP_REASONS:
+        return "cnp"
     else:
         print(f"Warning: Unknown reason '{reason}', defaulting to fraud generator")
         return "fraud"
@@ -310,6 +320,13 @@ def process_chargeback(paymentid):
         os.makedirs("pnr_test", exist_ok=True)
 
         generate_pnr_pdf(data, output_path, tenant, screenshots)
+
+    elif reason_type == "cnp":
+        print("Skipping Shopify screenshots (no-screenshots mode)")
+        print("Skipping card details image (no-screenshots mode)")
+
+        output_path = f"chargeback_cnp_{reference}.pdf"
+        generate_cnp_pdf(data, output_path, tenant, screenshots)
 
     else:  # pna
         print("Skipping Shopify screenshots (no-screenshots mode)")

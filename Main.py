@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chargeback_generator_fraud import generate_pdf as generate_fraud_pdf
 from chargeback_generator_pnr import generate_pdf as generate_pnr_pdf
 from chargeback_generator_pna import generate_pdf as generate_pna_pdf
+from chargeback_generator_cnp import generate_pdf as generate_cnp_pdf
 from session_evidence_extractor import SessionEvidenceExtractor
 from shopify_order_screenshot import screenshot_shopify_order, screenshot_shopify_order_by_url
 from shopify_tracking import get_shipping_proof
@@ -107,6 +108,13 @@ PNA_REASONS = [
     "quality_issue",
 ]
 
+# Credit Not Processed - same layout as PNA + payment verification image before shipping
+CNP_REASONS = [
+    "credit_not_processed",
+    "credit_not_issued",
+    "refund_not_processed",
+]
+
 
 def get_reason_type(reason):
     """Determine which generator to use based on reason code"""
@@ -121,6 +129,8 @@ def get_reason_type(reason):
         return "pnr"
     elif reason_lower in PNA_REASONS:
         return "pna"
+    elif reason_lower in CNP_REASONS:
+        return "cnp"
     else:
         print(f"Warning: Unknown reason '{reason}', defaulting to fraud generator")
         return "fraud"
@@ -401,6 +411,23 @@ def process_chargeback(paymentid):
         os.makedirs("pnr_test", exist_ok=True)
 
         generate_pnr_pdf(data, output_path, tenant, screenshots)
+
+    elif reason_type == "cnp":
+        # CNP - Same as PNA but with payment verification image before shipping
+        print("Capturing Shopify screenshots for CNP case...")
+        screenshots = get_shopify_screenshots(tenant_id, tenant, reference, external_reference, shop_name)
+
+        # Get card details image for payment verification section
+        print("Generating card details image...")
+        card_details_data = get_card_details_image(tenant_id, external_reference, reference, SCREENSHOT_DIR)
+        if card_details_data and card_details_data.get('screenshot_path'):
+            screenshots['card_details_screenshot'] = card_details_data['screenshot_path']
+            print(f"  Card details: {card_details_data['screenshot_path']}")
+        else:
+            print("  Failed to generate card details image")
+
+        output_path = f"chargeback_cnp_{reference}.pdf"
+        generate_cnp_pdf(data, output_path, tenant, screenshots)
 
     else:  # pna
         # PNA - Get Shopify screenshots + return policy
